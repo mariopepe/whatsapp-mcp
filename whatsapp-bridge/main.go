@@ -49,6 +49,8 @@ var forwardSelfMessages = getEnvBool("FORWARD_SELF", true)
 var fullHistoryPairFlag = flag.Bool("full-history-pair", false,
 	"Request full history at pair time (only effective when re-pairing; no-op for existing sessions)")
 
+const whatsmeowDBPath = "store/whatsapp.db"
+
 // getEnvBool reads a boolean env var with a default.
 // Accepts: 1/true/yes/on and 0/false/no/off (case-insensitive)
 func getEnvBool(key string, def bool) bool {
@@ -78,7 +80,8 @@ type Message struct {
 
 // Database handler for storing message history
 type MessageStore struct {
-	db *sql.DB
+	db   *sql.DB
+	waDB *sql.DB // whatsmeow's DB for contact name resolution fallback
 }
 
 type ChatEphemeralSettings struct {
@@ -145,18 +148,48 @@ func NewMessageStore() (*MessageStore, error) {
 
 		CREATE INDEX IF NOT EXISTS idx_calls_chat ON calls(chat_jid);
 		CREATE INDEX IF NOT EXISTS idx_calls_timestamp ON calls(timestamp);
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_jid ON messages(chat_jid);
 	`)
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Open whatsmeow's database read-only for contact name resolution fallback.
+	// Missing DBs are expected on first run and should not create a new file.
+	waDB, err := openWhatsmeowContactsDB(whatsmeowDBPath)
+	if err != nil {
+		fmt.Printf("Warning: could not open whatsmeow database for contact resolution: %v\n", err)
+	}
+
 	if err := ensureMessageStoreSchema(db); err != nil {
 		_ = db.Close()
+		if waDB != nil {
+			_ = waDB.Close()
+		}
 		return nil, err
 	}
 
-	return &MessageStore{db: db}, nil
+	return &MessageStore{db: db, waDB: waDB}, nil
+}
+
+func openWhatsmeowContactsDB(path string) (*sql.DB, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro", path))
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func ensureMessageStoreSchema(db *sql.DB) error {
@@ -168,6 +201,9 @@ func ensureMessageStoreSchema(db *sql.DB) error {
 	}
 	if err := ensureColumn(db, "messages", "deleted_at", "TIMESTAMP"); err != nil {
 		return fmt.Errorf("failed to ensure messages.deleted_at column: %w", err)
+	}
+	if err := ensureColumn(db, "messages", "quoted_message_id", "TEXT"); err != nil {
+		return fmt.Errorf("failed to ensure messages.quoted_message_id column: %w", err)
 	}
 	return nil
 }
@@ -545,9 +581,16 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 	return nil
 }
 
-// Close the database connection
+// Close the database connections
 func (store *MessageStore) Close() error {
-	return store.db.Close()
+	var waErr error
+	if store.waDB != nil {
+		waErr = store.waDB.Close()
+	}
+	if err := store.db.Close(); err != nil {
+		return err
+	}
+	return waErr
 }
 
 // Store a chat in the database. An empty `name` preserves any existing
@@ -617,16 +660,27 @@ func (store *MessageStore) GetChatEphemeralSettings(jid string) (ChatEphemeralSe
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedMessageId string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
+	// Store empty quoted_message_id as SQL NULL so the column is null for
+	// plain messages (no ContextInfo). This makes the ON CONFLICT merge
+	// straightforward: COALESCE prefers the new non-null value over a
+	// kept null, and ignores an incoming null so it cannot clobber a
+	// previously-stored ID.
+	var qmid interface{}
+	if quotedMessageId != "" {
+		qmid = quotedMessageId
+	}
+
 	_, err := store.db.Exec(
 		`INSERT INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_message_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, chat_jid) DO UPDATE SET
 			sender = excluded.sender,
 			content = excluded.content,
@@ -638,8 +692,9 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 			media_key = excluded.media_key,
 			file_sha256 = excluded.file_sha256,
 			file_enc_sha256 = excluded.file_enc_sha256,
-			file_length = excluded.file_length`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+			file_length = excluded.file_length,
+			quoted_message_id = COALESCE(excluded.quoted_message_id, messages.quoted_message_id)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, qmid,
 	)
 	return err
 }
@@ -811,6 +866,48 @@ func extractTextContent(msg *waProto.Message) string {
 		return doc.GetCaption()
 	}
 
+	// WhatsApp Business templates arrive hydrated — body lives in
+	// HydratedTemplate.HydratedContentText. Without this branch every
+	// template-sent message (e.g. WABA Connect Hrms_* notifications)
+	// returns "" and the row is silently skipped at the storage gate.
+	if tpl := msg.GetTemplateMessage(); tpl != nil {
+		if h := tpl.GetHydratedTemplate(); h != nil {
+			if t := h.GetHydratedContentText(); t != "" {
+				return t
+			}
+		}
+	}
+	if btn := msg.GetButtonsMessage(); btn != nil {
+		if t := btn.GetContentText(); t != "" {
+			return t
+		}
+		if t := btn.GetText(); t != "" {
+			return t
+		}
+	}
+	if ia := msg.GetInteractiveMessage(); ia != nil {
+		if body := ia.GetBody(); body != nil {
+			if t := body.GetText(); t != "" {
+				return t
+			}
+		}
+	}
+	if lst := msg.GetListMessage(); lst != nil {
+		if t := lst.GetDescription(); t != "" {
+			return t
+		}
+	}
+	if br := msg.GetButtonsResponseMessage(); br != nil {
+		if t := br.GetSelectedDisplayText(); t != "" {
+			return t
+		}
+	}
+	if tbr := msg.GetTemplateButtonReplyMessage(); tbr != nil {
+		if t := tbr.GetSelectedDisplayText(); t != "" {
+			return t
+		}
+	}
+
 	return ""
 }
 
@@ -822,9 +919,21 @@ type SendMessageResponse struct {
 
 // SendMessageRequest represents the request body for the send message API
 type SendMessageRequest struct {
-	Recipient string `json:"recipient"`
-	Message   string `json:"message"`
-	MediaPath string `json:"media_path,omitempty"`
+	Recipient       string `json:"recipient"`
+	Message         string `json:"message"`
+	MediaPath       string `json:"media_path,omitempty"`
+	QuotedMessageID string `json:"quoted_message_id,omitempty"`
+	QuotedSenderJID string `json:"quoted_sender_jid,omitempty"`
+	QuotedContent   string `json:"quoted_content,omitempty"`
+}
+
+// ReactRequest is the request body for the /api/react endpoint.
+type ReactRequest struct {
+	Recipient string  `json:"recipient"`  // chat JID
+	MessageID string  `json:"message_id"` // ID of the message being reacted to
+	FromMe    bool    `json:"from_me"`    // whether the reacted-to message was sent by us
+	SenderJID string  `json:"sender_jid"` // full JID of the reacted-to message's sender
+	Emoji     *string `json:"emoji"`      // reaction emoji; empty string removes the reaction
 }
 
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
@@ -1036,7 +1145,7 @@ func resolveRecipientJID(client *whatsmeow.Client, recipient string) (types.JID,
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string, quotedMsgID string, quotedSenderJID string, quotedContent string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -1155,6 +1264,20 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 				FileLength:    &resp.FileLength,
 			}
 		}
+	} else if quotedMsgID != "" {
+		// Quoted reply: use ExtendedTextMessage so we can attach ContextInfo.
+		// Only text quoting is supported; quoting media messages is not exposed
+		// because the quoted preview on the recipient's device requires the
+		// original media's key/URL, which is not available to the API caller.
+		ctx := &waProto.ContextInfo{
+			StanzaID:      proto.String(quotedMsgID),
+			Participant:   proto.String(quotedSenderJID),
+			QuotedMessage: &waProto.Message{Conversation: proto.String(quotedContent)},
+		}
+		msg.ExtendedTextMessage = &waProto.ExtendedTextMessage{
+			Text:        proto.String(message),
+			ContextInfo: ctx,
+		}
 	} else {
 		msg.Conversation = proto.String(message)
 	}
@@ -1219,7 +1342,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 		}
 		if storeErr := messageStore.StoreMessage(
 			resp.ID, chatJID, senderUser, message, timestamp, true,
-			mediaType, filename, "", nil, nil, nil, 0,
+			mediaType, filename, "", nil, nil, nil, 0, quotedMsgID,
 		); storeErr != nil {
 			fmt.Printf("Warning: failed to persist outbound message: %v\n", storeErr)
 		}
@@ -1315,6 +1438,16 @@ func extractMediaInfo(msg *waProto.Message, msgTimestamp time.Time, msgID string
 		}
 		return "document", filename,
 			doc.GetURL(), doc.GetMediaKey(), doc.GetFileSHA256(), doc.GetFileEncSHA256(), doc.GetFileLength()
+	}
+
+	// Sticker message: WebP image, no caption, same URL+MediaKey+SHA shape as other media.
+	// On the wire stickers surface as type="media" with an <enc mediatype="sticker"> payload, e.g.:
+	//   <message id="..." type="media">
+	//     <enc mediatype="sticker" type="msg" v="2"><!-- 660 bytes --></enc>
+	//   </message>
+	if stk := msg.GetStickerMessage(); stk != nil {
+		return "sticker", "sticker_" + suffix + ".webp",
+			stk.GetURL(), stk.GetMediaKey(), stk.GetFileSHA256(), stk.GetFileEncSHA256(), stk.GetFileLength()
 	}
 
 	return "", "", "", nil, nil, nil, 0
@@ -1440,6 +1573,33 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Reactions arrive as their own message stanza rather than message content.
+	// Persist them in the messages table as media_type="reaction", with the
+	// emoji in `content` and the reacted-to message ID in `filename`, then
+	// return — a reaction is not a normal content message. An empty emoji is a
+	// valid event meaning "reaction removed"; we store it (so consumers see the
+	// removal) rather than dropping it.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		reactedToID := ""
+		if key := reaction.GetKey(); key != nil {
+			reactedToID = key.GetID()
+		}
+		if reactedToID != "" {
+			emoji := reaction.GetText()
+			if err := messageStore.StoreMessage(
+				msg.Info.ID, chatJID, sender, emoji,
+				msg.Info.Timestamp, msg.Info.IsFromMe,
+				"reaction", reactedToID, "", nil, nil, nil, 0, "",
+			); err != nil {
+				logger.Warnf("Failed to store reaction: %v", err)
+			}
+			if forwardSelfMessages || !msg.Info.IsFromMe {
+				SendReactionWebhook(sender, chatJID, msg.Info.IsFromMe, msg.Info.ID, reactedToID, emoji)
+			}
+		}
+		return
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -1470,6 +1630,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedMessageId,
 	)
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
@@ -1815,6 +1976,8 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		ext = ".mp4"
 	case "audio":
 		ext = ".ogg"
+	case "sticker":
+		ext = ".webp"
 	case "document":
 		ext = ""
 	default:
@@ -1867,6 +2030,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		waMediaType = whatsmeow.MediaAudio
 	case "document":
 		waMediaType = whatsmeow.MediaDocument
+	case "sticker":
+		// whatsmeow derives sticker decryption keys from the image HKDF info string
+		// (see download.go: classToMediaType maps "StickerMessage" -> MediaImage).
+		waMediaType = whatsmeow.MediaImage
 	default:
 		return false, "", "", "", fmt.Errorf("unsupported media type: %s", mediaType)
 	}
@@ -1908,13 +2075,10 @@ func extractDirectPathFromURL(url string) string {
 		return url // Return original URL if parsing fails
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	// Keep the query string: it carries the CDN auth tokens (oh=/oe=).
+	// whatsmeow's Download rebuilds the URL as host + directPath + "&hash=..."
+	// and the CDN returns 403 if the auth params are missing.
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality.
@@ -2000,7 +2164,7 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			req.Recipient, len(req.Message), resolvedMediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, resolvedMediaPath, req.QuotedMessageID, req.QuotedSenderJID, req.QuotedContent)
 		fmt.Printf("← /api/send success=%v status=%q\n", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -2015,6 +2179,56 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 			Success: success,
 			Message: message,
 		})
+	}))
+
+	// Handler for sending (or removing) emoji reactions
+	mux.HandleFunc("/api/react", auth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ReactRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Recipient == "" || req.MessageID == "" || req.Emoji == nil {
+			http.Error(w, "recipient, message_id, and emoji are required", http.StatusBadRequest)
+			return
+		}
+		chatJID, err := types.ParseJID(req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid recipient JID: %v", err), http.StatusBadRequest)
+			return
+		}
+		var senderJID types.JID
+		switch {
+		case req.FromMe:
+			if client.Store.ID == nil {
+				http.Error(w, "Not logged in", http.StatusServiceUnavailable)
+				return
+			}
+			senderJID = *client.Store.ID
+		case req.SenderJID != "":
+			if senderJID, err = types.ParseJID(req.SenderJID); err != nil {
+				http.Error(w, fmt.Sprintf("Invalid sender_jid: %v", err), http.StatusBadRequest)
+				return
+			}
+			if senderJID.User == "" || senderJID.Server == "" {
+				http.Error(w, "Invalid sender_jid", http.StatusBadRequest)
+				return
+			}
+		default:
+			if chatJID.Server == types.GroupServer {
+				http.Error(w, "sender_jid is required for group reactions when from_me is false", http.StatusBadRequest)
+				return
+			}
+			senderJID = chatJID
+		}
+		msg := client.BuildReaction(chatJID, senderJID, req.MessageID, *req.Emoji)
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := client.SendMessage(context.Background(), chatJID, msg); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]bool{"ok": true})
 	}))
 
 	// Handler for downloading media
@@ -2276,6 +2490,46 @@ func main() {
 		return
 	}
 
+	// Resolve the REST API port. Pure env parsing with no dependency on the
+	// WhatsApp connection, so it's safe to do this early alongside the token
+	// load below — and failing fast here means we don't run a QR-pairing
+	// flow only to error out on an invalid port afterwards.
+	port := 8080
+	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
+		v, err := strconv.Atoi(p)
+		if err != nil || v < 1 || v > 65535 {
+			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
+			return
+		}
+		port = v
+	}
+
+	// Load (or generate on first run) the bearer token used to authenticate
+	// REST callers, and attach it to outbound webhook POSTs so the hub's
+	// fail-closed inbound-auth middleware accepts them (see auth.go and
+	// webhook.go). This MUST happen before the event handler below is
+	// registered: WhatsApp can deliver messages — including a burst of
+	// history-sync backlog — as soon as the connection succeeds, and any
+	// message handled before this assignment would go out with no bridge
+	// token attached.
+	bridgeToken, fresh, tokErr := loadOrCreateBridgeToken()
+	if tokErr != nil {
+		logger.Errorf("Failed to initialize bridge token: %v", tokErr)
+		return
+	}
+	webhookAuthToken = bridgeToken
+
+	// Print the one-time setup banner immediately, before attempting to
+	// connect/pair. loadOrCreateBridgeToken() already persisted the token to
+	// disk as soon as it generated one; if the banner instead waited until
+	// after a successful connection (as it used to), a QR-pairing timeout or
+	// early exit would leave a token on disk that was never shown to the
+	// user — and loadOrCreateBridgeToken() would report fresh=false on every
+	// later run, so the banner would never get a second chance to print it.
+	if fresh {
+		printTokenBanner(bridgeToken, port)
+	}
+
 	// Channel to signal reconnection needs
 	reconnectChan := make(chan bool, 1)
 
@@ -2491,30 +2745,11 @@ connectionSuccess:
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
-	// Start REST API server
-	port := 8080
-	if p := os.Getenv("WHATSAPP_BRIDGE_PORT"); p != "" {
-		v, err := strconv.Atoi(p)
-		if err != nil || v < 1 || v > 65535 {
-			logger.Errorf("Invalid WHATSAPP_BRIDGE_PORT=%q, must be 1-65535", p)
-			return
-		}
-		port = v
-	}
+	// port and bridgeToken were already resolved above, before the connect/
+	// pairing loop, so the setup banner could print immediately.
 
-	// Load (or generate on first run) the bearer token used to authenticate
-	// REST callers, and resolve the allow-listed roots that media_path values
-	// in /api/send must live under. See auth.go and media_path.go for the
-	// rationale.
-	bridgeToken, fresh, tokErr := loadOrCreateBridgeToken()
-	if tokErr != nil {
-		logger.Errorf("Failed to initialize bridge token: %v", tokErr)
-		return
-	}
-	if fresh {
-		printTokenBanner(bridgeToken, port)
-	}
-
+	// Resolve the allow-listed roots that media_path values in /api/send must
+	// live under. See media_path.go for the rationale.
 	allowedMediaRoots, mrErr := resolveMediaRoots()
 	if mrErr != nil {
 		logger.Errorf("Failed to resolve media roots: %v", mrErr)
@@ -2607,17 +2842,17 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 			var displayName, convName *string
 			// Try to extract the fields we care about regardless of the exact type
 			v := reflect.ValueOf(conversation)
-			if v.Kind() == reflect.Ptr && !v.IsNil() {
+			if v.Kind() == reflect.Pointer && !v.IsNil() {
 				v = v.Elem()
 
 				// Try to find DisplayName field
-				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Ptr && !displayNameField.IsNil() {
+				if displayNameField := v.FieldByName("DisplayName"); displayNameField.IsValid() && displayNameField.Kind() == reflect.Pointer && !displayNameField.IsNil() {
 					dn := displayNameField.Elem().String()
 					displayName = &dn
 				}
 
 				// Try to find Name field
-				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Ptr && !nameField.IsNil() {
+				if nameField := v.FieldByName("Name"); nameField.IsValid() && nameField.Kind() == reflect.Pointer && !nameField.IsNil() {
 					n := nameField.Elem().String()
 					convName = &n
 				}
@@ -2647,22 +2882,55 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
+		// Use contact info (full name)
 		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
 		} else {
-			// Last fallback to JID
-			name = jid.User
+			name = lookupLocalContactName(client, messageStore, chatJID, logger)
+
+			if name == "" {
+				if sender != "" {
+					name = sender
+				} else {
+					name = jid.User
+				}
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
 	}
 
 	return name
+}
+
+func lookupLocalContactName(client *whatsmeow.Client, messageStore *MessageStore, chatJID string, logger waLog.Logger) string {
+	if client == nil || client.Store == nil || client.Store.ID == nil || messageStore == nil || messageStore.waDB == nil {
+		return ""
+	}
+
+	var localName string
+	err := messageStore.waDB.QueryRow(
+		`SELECT COALESCE(
+			NULLIF(full_name, ''),
+			NULLIF(push_name, ''),
+			NULLIF(first_name, ''),
+			NULLIF(business_name, ''),
+			''
+		) FROM whatsmeow_contacts WHERE our_jid = ? AND their_jid = ?`,
+		client.Store.ID.String(),
+		chatJID,
+	).Scan(&localName)
+	if err == nil {
+		if localName != "" {
+			logger.Infof("Using local contact name for %s: %s", chatJID, localName)
+		}
+		return localName
+	}
+	if err != sql.ErrNoRows && !strings.Contains(err.Error(), "no such table: whatsmeow_contacts") {
+		logger.Warnf("Failed to query local contact name for %s: %v", chatJID, err)
+	}
+	return ""
 }
 
 // callChatJID resolves the chat JID that a call belongs to. For group calls
@@ -2878,6 +3146,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					"", // quoted_message_id: history sync does not carry ContextInfo
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
