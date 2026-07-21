@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -17,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/proto/waMmsRetry"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
@@ -1635,20 +1638,163 @@ func (d *MediaDownloader) GetMediaType() whatsmeow.MediaType {
 	return d.MediaType
 }
 
+// Media retry registry.
+//
+// WhatsApp media is fetched from a CDN via a server-signed `directPath`. When
+// that signature expires (WhatsApp rotates it server-side), every fresh
+// download fails with HTTP 403/404/410. The only recovery is to ask the
+// sender's phone to re-sign the media via SendMediaRetryReceipt; the phone
+// replies asynchronously with an events.MediaRetry that carries a refreshed
+// directPath. We match that async reply back to the waiting download by the
+// message ID through this registry.
+var (
+	mediaRetryMu      sync.Mutex
+	mediaRetryWaiters = make(map[types.MessageID]chan *events.MediaRetry)
+)
+
+func registerMediaRetryWaiter(id types.MessageID) chan *events.MediaRetry {
+	ch := make(chan *events.MediaRetry, 1)
+	mediaRetryMu.Lock()
+	mediaRetryWaiters[id] = ch
+	mediaRetryMu.Unlock()
+	return ch
+}
+
+func unregisterMediaRetryWaiter(id types.MessageID) {
+	mediaRetryMu.Lock()
+	delete(mediaRetryWaiters, id)
+	mediaRetryMu.Unlock()
+}
+
+// dispatchMediaRetry routes an incoming events.MediaRetry to a waiting download.
+func dispatchMediaRetry(evt *events.MediaRetry) {
+	mediaRetryMu.Lock()
+	ch := mediaRetryWaiters[evt.MessageID]
+	mediaRetryMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- evt:
+		default:
+		}
+	}
+}
+
+// downloadWithMediaRetry downloads media, and if the direct download fails with
+// an expired-token error (HTTP 403/404/410) it requests the sender's phone to
+// re-sign the media, waits for the async events.MediaRetry, and re-downloads
+// from the refreshed directPath. For non-recoverable errors it returns as-is.
+func downloadWithMediaRetry(client *whatsmeow.Client, downloader *MediaDownloader, messageID, chatJID, sender string, isFromMe bool) ([]byte, error) {
+	ctx := context.Background()
+
+	data, err := client.Download(ctx, downloader)
+	if err == nil {
+		return data, nil
+	}
+	// Only expired-token failures are recoverable via a media retry.
+	if !errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith403) &&
+		!errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith404) &&
+		!errors.Is(err, whatsmeow.ErrMediaDownloadFailedWith410) {
+		return nil, err
+	}
+
+	fmt.Printf("⚠️  direct download failed (%v) for %s, requesting media retry from sender's phone...\n", err, messageID)
+
+	chatJ, perr := types.ParseJID(chatJID)
+	if perr != nil {
+		return nil, fmt.Errorf("media retry: bad chat jid %q: %w", chatJID, perr)
+	}
+	isGroup := chatJ.Server == types.GroupServer
+	info := &types.MessageInfo{
+		ID: messageID,
+		MessageSource: types.MessageSource{
+			Chat:     chatJ,
+			IsFromMe: isFromMe,
+			IsGroup:  isGroup,
+		},
+	}
+	// The phone needs the participant only for group messages. WhatsApp now
+	// addresses group senders by their LID (addressing_mode="lid"), and the
+	// sender's phone only answers a media-retry receipt that is addressed to
+	// that LID. Our MigrateLegacyLIDSendersToPhones rewrites the stored `sender`
+	// to the phone JID, so a receipt built from it goes to @s.whatsapp.net and is
+	// silently ignored (documents/videos then never get re-signed → 30s timeout).
+	// Fix: resolve the phone JID back to its LID and use that as the participant.
+	if isGroup && sender != "" {
+		// A bare phone number ("393202782113") is NOT a parseable JID: ParseJID
+		// succeeds but yields a malformed JID with an empty server, so GetLIDForPN
+		// rejects it ("invalid GetLIDForPN call with non-PN JID") and the retry
+		// receipt falls back to the phone JID — which the sender's phone silently
+		// ignores (30s timeout, no media). Build a proper <num>@s.whatsapp.net PN
+		// JID when the stored sender has no "@" (the norm post-LID-migration).
+		var senderJID types.JID
+		if strings.Contains(sender, "@") {
+			pj, serr := types.ParseJID(sender)
+			if serr != nil {
+				pj = types.NewJID(sender, types.DefaultUserServer)
+			}
+			senderJID = pj
+		} else {
+			senderJID = types.NewJID(sender, types.DefaultUserServer)
+		}
+		if senderJID.Server != types.HiddenUserServer && client.Store != nil {
+			if isFromMe && !client.Store.LID.IsEmpty() {
+				// Our own message: address the retry to our own LID (the PN->LID
+				// store may not hold a self-mapping, so use the device's LID).
+				senderJID = client.Store.LID.ToNonAD()
+			} else if client.Store.LIDs != nil {
+				lid, lerr := client.Store.LIDs.GetLIDForPN(ctx, senderJID)
+				fmt.Printf("🔎 media-retry LID resolve: pn=%s -> lid=%q empty=%v err=%v\n", senderJID.String(), lid.String(), lid.IsEmpty(), lerr)
+				if lerr == nil && !lid.IsEmpty() {
+					senderJID = lid
+				}
+			}
+		}
+		info.Sender = senderJID
+	}
+
+	ch := registerMediaRetryWaiter(messageID)
+	defer unregisterMediaRetryWaiter(messageID)
+
+	if rerr := client.SendMediaRetryReceipt(ctx, info, downloader.GetMediaKey()); rerr != nil {
+		return nil, fmt.Errorf("send media retry receipt: %w", rerr)
+	}
+
+	select {
+	case evt := <-ch:
+		if evt.Error != nil && evt.Ciphertext == nil {
+			return nil, fmt.Errorf("media retry rejected by phone (code %d; it may no longer hold this media)", evt.Error.Code)
+		}
+		notif, derr := whatsmeow.DecryptMediaRetryNotification(evt, downloader.GetMediaKey())
+		if derr != nil {
+			return nil, fmt.Errorf("decrypt media retry notification: %w", derr)
+		}
+		if notif.GetResult() != waMmsRetry.MediaRetryNotification_SUCCESS {
+			return nil, fmt.Errorf("media retry unsuccessful (result=%v; the phone may not have the media)", notif.GetResult())
+		}
+		downloader.DirectPath = notif.GetDirectPath()
+		fmt.Printf("🔁 media retry succeeded for %s, re-downloading from refreshed path\n", messageID)
+		return client.DownloadMediaWithPath(ctx, downloader.GetDirectPath(), downloader.GetFileEncSHA256(), downloader.GetFileSHA256(), downloader.GetMediaKey(), downloader.GetMediaType(), "", false)
+	case <-time.After(30 * time.Second):
+		return nil, fmt.Errorf("timed out waiting for media retry response for %s", messageID)
+	}
+}
+
 // Function to download media from a message
 func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, messageID, chatJID string) (bool, string, string, string, error) {
 	// Query the database for the message including timestamp
-	var mediaType, url string
+	var mediaType, url, sender string
 	var mediaKey, fileSHA256, fileEncSHA256 []byte
 	var fileLength uint64
 	var timestamp time.Time
+	var isFromMe bool
 	var err error
 
-	// Get media info AND timestamp from the database
+	// Get media info AND timestamp from the database (sender + is_from_me are
+	// needed to build the MessageInfo for a media-retry receipt).
 	err = messageStore.db.QueryRow(
-		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp FROM messages WHERE id = ? AND chat_jid = ?",
+		"SELECT media_type, url, media_key, file_sha256, file_enc_sha256, file_length, timestamp, sender, is_from_me FROM messages WHERE id = ? AND chat_jid = ?",
 		messageID, chatJID,
-	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp)
+	).Scan(&mediaType, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength, &timestamp, &sender, &isFromMe)
 
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to find message: %v", err)
@@ -1735,8 +1881,9 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		MediaType:     waMediaType,
 	}
 
-	// Download the media using whatsmeow client
-	mediaData, err := client.Download(context.Background(), downloader)
+	// Download the media using whatsmeow client, recovering from an expired
+	// signed directPath (403/404/410) via WhatsApp's media-retry mechanism.
+	mediaData, err := downloadWithMediaRetry(client, downloader, messageID, chatJID, sender, isFromMe)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -2142,6 +2289,11 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.MediaRetry:
+			// Async reply from the sender's phone to a SendMediaRetryReceipt;
+			// route it to the download waiting on a refreshed directPath.
+			dispatchMediaRetry(v)
 
 		case *events.GroupInfo:
 			if v.Ephemeral != nil {
