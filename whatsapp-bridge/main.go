@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"google.golang.org/protobuf/reflect/protoreflect"
 	"io"
 	"math"
 	"math/rand"
@@ -1935,6 +1936,7 @@ func takeOriginalTimestamp(id string) (time.Time, bool) {
 }
 
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	msg.Message = unwrapExtraWrappers(msg.Message)
 	// Resolve LID-based chats to phone-based JIDs so that incoming
 	// and outgoing messages land in the same chat entry.
 	resolvedChat := resolveLIDChat(client, msg.Info.Chat, msg.Info.SenderAlt, msg.Info.RecipientAlt, msg.Info.IsFromMe)
@@ -2032,8 +2034,10 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	quotedMessageId, quotedSender, quotedContent := extractQuotedMessageInfo(msg.Message)
 	mentionedJIDs := extractMentionedJIDs(msg.Message)
 
-	// Skip if there's no content and no media
+	// Skip if there's no content and no media. Log what was dropped: a silent
+	// drop here hid album images (AssociatedChildMessage) for weeks.
 	if content == "" && mediaType == "" {
+		logDroppedMessage(msg, chatJID, logger)
 		return
 	}
 
@@ -3983,4 +3987,48 @@ func placeholderWaveform(duration uint32) []byte {
 	}
 
 	return waveform
+}
+
+// unwrapExtraWrappers peels wrappers that whatsmeow's UnwrapRaw leaves in
+// place. Album images after the first arrive as AssociatedChildMessage; without
+// this the bridge saw "no content, no media" and silently dropped them.
+func unwrapExtraWrappers(m *waProto.Message) *waProto.Message {
+	for i := 0; i < 4 && m != nil; i++ {
+		if child := m.GetAssociatedChildMessage().GetMessage(); child != nil {
+			if child.MessageContextInfo == nil {
+				child.MessageContextInfo = m.MessageContextInfo
+			}
+			m = child
+			continue
+		}
+		break
+	}
+	return m
+}
+
+// benignDropFields are control messages that legitimately carry no text/media.
+var benignDropFields = map[string]bool{
+	"messageContextInfo": true, "protocolMessage": true, "senderKeyDistributionMessage": true,
+	"pollUpdateMessage": true, "encReactionMessage": true, "keepInChatMessage": true,
+	"pinInChatMessage": true, "encEventResponseMessage": true,
+}
+
+// logDroppedMessage records which top-level fields a skipped message carried,
+// so a new wrapper type shows up in the log instead of vanishing.
+func logDroppedMessage(msg *events.Message, chatJID string, logger waLog.Logger) {
+	if msg.Message == nil {
+		return
+	}
+	var fields []string
+	msg.Message.ProtoReflect().Range(func(fd protoreflect.FieldDescriptor, _ protoreflect.Value) bool {
+		if name := string(fd.Name()); !benignDropFields[name] {
+			fields = append(fields, name)
+		}
+		return true
+	})
+	if len(fields) == 0 {
+		return
+	}
+	logger.Warnf("Dropped message %s in %s: no text or media extracted (fields: %s)",
+		msg.Info.ID, chatJID, strings.Join(fields, ","))
 }
